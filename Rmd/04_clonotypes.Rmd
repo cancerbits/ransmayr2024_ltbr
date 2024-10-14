@@ -1,0 +1,172 @@
+---
+title: 'Immune profiling analysis'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 2
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.R'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = FALSE, autoWidth = TRUE))
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+
+rds_dir <- file.path(config$out_root, 'Rds')
+```
+
+# Load scRNA-seq results
+```{r}
+# load results of cell type annotation 
+s_md <- readRDS(file = file.path(rds_dir, '03_integrated_annotated_meta_data.rds'))
+s_md$barcode <- rownames(s_md)
+```
+
+
+# Immune profiling analysis
+
+## Read data; first overview
+
+Read clonotype contig annotations into one big data frame and print table of Sample ID vs Chain detected. Note that we keep only observations with productive contig (likely functional T or B cell receptor) and annotated with a single chain (discarding 'Multi' chains that we see in gdTCR results quite often)
+```{r}
+path = config$data_root
+clonotype_files <- list.files(path = path, pattern = '^filtered_contig_annotations\\.csv$', recursive = TRUE, full.names = TRUE)
+ret <- list()
+for (f in clonotype_files) {
+  clono_dat <- read.csv(f)
+  clono_dat$dir_name <- basename(dirname(f))
+  # also read the clonotype file, so we can add the iNKT and MAIT evidence
+  clono_anno <- read.csv(file = gsub(pattern = 'filtered_contig_annotations\\.csv$', 
+                                     x = f,
+                                     replacement = 'clonotypes.csv'))
+  if (all(c('clonotype_id', 'inkt_evidence', 'mait_evidence') %in% colnames(clono_anno))) {
+    clono_dat <- left_join(clono_dat, clono_anno[, c('clonotype_id', 'inkt_evidence', 'mait_evidence')], by = c('raw_clonotype_id' = 'clonotype_id'))
+  } else {
+    clono_dat$inkt_evidence <- ''
+    clono_dat$mait_evidence <- ''
+  }
+  
+  ret[[basename(dirname(f))]] <- clono_dat
+}
+clono_dat <- do.call(rbind, ret)
+#print(table(clono_dat$dir_name, clono_dat$productive))
+clono_dat <- do.call(rbind, ret) %>% filter(productive %in% c('true', 'True'), chain != 'Multi')
+```
+
+Table of directory name and chain
+```{r}
+print(table(clono_dat$dir_name, clono_dat$chain))
+```
+
+Infer sample IDs from directory names and show sample-chain table
+```{r}
+# infer sample ids from directory names
+clono_dat$sample_id <- gsub(pattern = '_(abTCR|BCR|gdTCR)_VDJ(_GD)*', replacement = '', x = clono_dat$dir_name)
+print(table(clono_dat$sample_id, clono_dat$chain))
+
+clono_dat$sample_number <- as.integer(stringr::str_extract(clono_dat$sample_id, '\\d+'))
+# make sure the cell barcode matches the names assigned by Seurat in the merged and integrated analysis
+clono_dat$barcode <- paste(clono_dat$barcode, clono_dat$sample_number, sep = '_')
+```
+
+Aggregate the chain counts per cell. How often do we see certain chains together (and how many of them)?
+```{r}
+chain_counts <- arrange(clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>% 
+  summarise(n = n()) %>%
+  mutate(chain_count = paste(chain, n, sep=':')) %>%
+  summarise(chains = paste(chain_count, collapse = ';'))
+tab <- as.data.frame(sort(table(chain_counts$chains), decreasing = TRUE))
+colnames(tab) <- c('Chain counts', 'Cells')
+DT::datatable(tab)
+```
+
+
+```{r}
+# combine the information per cell; use only data with productive CDR3
+clono_sum <- arrange(clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode) %>% 
+  mutate(chain_cdr3 = paste(chain, cdr3, sep=':')) %>%
+  summarise(clonotype = paste(chain_cdr3, collapse = ';'),
+            inkt_evidence = paste(setdiff(sort(unique(inkt_evidence)), ''), collapse = ';'),
+            mait_evidence = paste(setdiff(sort(unique(mait_evidence)), ''), collapse = ';')) %>%
+  mutate(has_TRAB = grepl(pattern = 'TR[AB]:', x = clonotype),
+         has_IG = grepl(pattern = 'IG[HKL]:', x = clonotype),
+         has_TRDG = grepl(pattern = 'TR[DG]:', x = clonotype),
+         only_TRAB = has_TRAB & !has_IG & !has_TRDG,
+         only_IG = !has_TRAB & has_IG & !has_TRDG,
+         only_TRDG = !has_TRAB & !has_IG & has_TRDG)
+
+freq_ab <- filter(clono_sum, has_TRAB) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+freq_ig <- filter(clono_sum, has_IG) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+freq_dg <- filter(clono_sum, has_TRDG) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+# join with scRNA-seq results
+s_md <- left_join(s_md, clono_sum, by = 'barcode')
+pred_cell_types <- sort(unique(as.character(s_md$az.annotation)))
+s_md$az.annotation <- factor(s_md$az.annotation, levels = pred_cell_types)
+s_md <- left_join(s_md, chain_counts)
+```
+
+Save for later
+```{r}
+saveRDS(object = list(clono_dat = clono_dat, 
+                      clono_sum = clono_sum,
+                      md = s_md), 
+        file = file.path(rds_dir, '04_clonotypes.Rds'))
+```
+
+
+## Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

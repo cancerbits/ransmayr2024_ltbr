@@ -1,0 +1,95 @@
+---
+title: 'Differential expression analysis for Bernhard (using edgeR and all samples)'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.R'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = TRUE, autoWidth = TRUE))
+options(ggrepel.max.overlaps = Inf)
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+
+rds_dir <- file.path(config$out_root, 'Rds')
+```
+
+## Load data and annotation
+
+```{r}
+s  <- readRDS(file = file.path(rds_dir, '02_integrated_seurat_object.Rds'))
+md <- readRDS(file = file.path(rds_dir, '03_integrated_annotated_meta_data.Rds'))
+s <- AddMetaData(s, md)
+
+s$genotype <- factor(as.character(droplevels(s$genotype)), levels = c("LTBR mutant", 'WT'))
+```
+
+Show number of cells per sample and group
+```{r}
+print(table(s$orig.ident, s$genotype))
+```
+
+## Diff expr: LTBR mutant vs WT
+
+### Per cell type (filtered Azimuth predictions)
+
+Perform DE test between mutant and WT per cell type
+
+We only include cell types with at least 10 cells in at least 2 samples.
+
+```{r}
+sample_count <- colSums(table(s$orig.ident, s$az.annot.filtered) >= 10)
+coi <- names(sample_count)[sample_count > 1]
+s$az.annot.for.de <- s$az.annot.filtered
+s$az.annot.for.de[!(s$az.annot.for.de %in% coi)] <- NA
+
+table(s$orig.ident, s$az.annot.for.de)
+
+de <- run_edgeR_split(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                      group_labels = s$genotype, 
+                      sample_labels = s$orig.ident, 
+                      split_factor = s$az.annot.for.de)
+saveRDS(de, file = file.path(rds_dir, '05_DE_results.Rds'))
+```
+
+## Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,19 @@
+# History files
+.Rhistory
+
+# Session Data files
+.RData
+
+# User-specific files
+.Ruserdata
+.Rprofile
+
+# RStudio files and directories
+.Rproj.user
+*.Rproj
+.config
+.local
+
+# Custom files used during testing
+my_config.yaml
+bash/my_run_docker_rstudio.sh

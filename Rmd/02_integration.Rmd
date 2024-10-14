@@ -1,0 +1,182 @@
+---
+title: 'Integration'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  source(file.path(config$project_root, 'R', 'utils.R'))
+})
+
+future::plan(strategy = "sequential")
+options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = FALSE, scrollX = TRUE, scrollY = '350px',
+                          scrollCollapse = TRUE, searching = FALSE, autoWidth = TRUE))
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+
+rds_dir <- file.path(config$out_root, 'Rds')
+```
+
+Read merged object; add meta data; subset to samples of interest
+```{r}
+s <- readRDS(file = file.path(rds_dir, '01_s_merged.rds'))
+s$genotype <- factor(s$orig.ident)
+levels(s$genotype) <- c('WT', 'WT', 'WT', 'WT', 
+                        'LTBR mutant', 'LTBR mutant')
+
+print(table(s$orig.ident, s$genotype))
+```
+
+Perform ["standard" Seurat integration](https://satijalab.org/seurat/articles/integration_introduction.html#performing-integration-on-datasets-normalized-with-sctransform-1).
+```{r}
+s_list <- SplitObject(s, split.by = 'orig.ident')
+s_list <- lapply(s_list, function(s) {
+  DefaultAssay(s) <- 'RNA'
+  s <- DietSeurat(s, assays = 'RNA')
+  s <- SCTransform(s, verbose = FALSE, method = "qpoisson")
+  # exclude some genes from variable features: TR, MT, RP
+  vf <- VariableFeatures(s)
+  exclude <- grepl('^TR[ABGD][VDJ]', vf) | grepl('^MT-', vf) | grepl('^RP[SL]\\d+', vf)
+  VariableFeatures(s) <- vf[!exclude]
+  return(s)
+})
+
+features <- SelectIntegrationFeatures(object.list = s_list, nfeatures = 3000, verbose = FALSE)
+s_list <- PrepSCTIntegration(object.list = s_list, anchor.features = features, verbose = FALSE)
+
+anchors <- FindIntegrationAnchors(object.list = s_list, normalization.method = "SCT", 
+                                  anchor.features = features, verbose = FALSE)
+si <- IntegrateData(anchorset = anchors, normalization.method = "SCT", verbose = FALSE)
+si <- RunPCA(si, verbose = FALSE)
+dims <- 1:15
+si <- RunUMAP(si, reduction = "pca", dims = dims, verbose = FALSE)
+si <- FindNeighbors(si, reduction = "pca", dims = dims, verbose = FALSE)
+si <- FindClusters(si, resolution = 0.3, verbose = FALSE)
+
+
+p1 <- DimPlot(si, reduction = "umap", group.by = "orig.ident")
+p2 <- DimPlot(si, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE)
+```
+
+Show integration and new clustering
+
+```{r, fig.width=10, out.width='100%', fig.height=5}
+show(p1 + p2)
+```
+
+Show per-cluster composition 
+```{r, fig.width=9, out.width='100%', fig.height=3.5}
+cp <- composition_plots(df = si@meta.data, group_var = 'seurat_clusters', 
+                        comp_var = 'orig.ident', group_name = 'Integration cluster', 
+                        comp_name = 'Sample')
+show(cp$figure)
+```
+
+Show per-cluster QC stats
+```{r, fig.width=14, out.width='100%', fig.height=4}
+p1 <- VlnPlot(si, features = c('percent.mito', 'log10_nCount_RNA', 'nFeature_RNA'), pt.size = 0.1)
+show(p1)
+```
+
+Separate samples on UMAP
+```{r, out.width='100%', fig.height=3.5, fig.width=14}
+p1 <- DimPlot(si, label = TRUE, repel = TRUE, split.by = 'orig.ident') + NoLegend()
+show(p1)
+```
+
+Show per-sample composition based on integration clusters
+```{r, fig.width=9, out.width='100%', fig.height=3.5}
+cp <- composition_plots(df = si@meta.data, group_var = 'orig.ident', 
+                        comp_var = 'seurat_clusters', group_name = 'Sample', 
+                        comp_name = 'Integration cluster', freq_limit = 0)
+show(cp$figure & guides(fill=guide_legend(ncol=2)))
+```
+
+Look at cluster markers
+
+```{r}
+s$SCT@misc$de_res <- diff_mean_test(y = GetAssayData(s, assay = "SCT", slot = "counts"), 
+    group_labels = si$seurat_clusters, R = 99, only_pos = TRUE, only_top_n = 333, 
+    verbosity = 0)
+
+s$SCT@misc$top_markers <- filter(s$SCT@misc$de_res, mean1 >= 0.2) %>%
+    group_by(group1) %>%
+    arrange(-mean1, .by_group = TRUE) %>%
+    mutate(log2FC = scales::oob_squish_any(x = log2FC, range = c(0, 7)),
+           zscore = scales::oob_squish_any(x = zscore, range = c(0, 200)),
+           marker_rank = rank(-log2FC*log2FC*zscore)) %>%
+    slice_min(order_by = marker_rank, n = 6, with_ties = FALSE) %>% 
+    select(group1, gene, mean1, mean2, log2FC, zscore, emp_pval_adj)
+
+# make sure we transfer everything to the merged object for later
+s <- GetResidual(s, features = s$SCT@misc$top_markers$gene, verbose = FALSE)
+Idents(s) <- si$seurat_clusters
+s$integration_cluster <- si$seurat_clusters
+s$int_umap <- si$umap
+```
+
+```{r, fig.width=10, out.width='100%', fig.height=10}
+show(DoHeatmap(s, features = s$SCT@misc$top_markers$gene) + NoLegend())
+cells <- WhichCells(s, downsample = 100)
+show(DoHeatmap(s, features = s$SCT@misc$top_markers$gene, cells = cells) + NoLegend())
+```
+
+Try to find conserved markers?
+```{r}
+s$SCT@misc$de_res_cons <- diff_mean_test_conserved(
+  y = GetAssayData(s, assay = "SCT", slot = "counts"), 
+  group_labels = si$seurat_clusters, 
+  sample_labels = si$orig.ident, only_pos = TRUE, verbosity = 0)
+
+s$SCT@misc$top_markers_cons <- filter(s$SCT@misc$de_res_cons, de_tests == max(de_tests), log2FC_min > 1, p.adjust(pval_max) <= 0.001) %>% 
+  group_by(group1) %>% 
+  filter(rank(-log2FC_median, ties.method = "first") <= 6)
+
+s <- GetResidual(s, features = s$SCT@misc$top_markers_cons$gene, verbose = FALSE)
+```
+
+```{r, fig.width=10, out.width='100%', fig.height=10}
+show(DoHeatmap(s, features = s$SCT@misc$top_markers_cons$gene) + NoLegend())
+cells <- WhichCells(s, downsample = 100)
+show(DoHeatmap(s, features = s$SCT@misc$top_markers_cons$gene, cells = cells) + NoLegend())
+```
+
+Save integration results
+
+```{r}
+saveRDS(object = s, file = file.path(rds_dir, '02_integrated_seurat_object.Rds'))
+```
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

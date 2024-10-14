@@ -1,0 +1,20 @@
+# do not change the next line
+project_name: ransmayr2024_ltbr
+# do not change the next line
+project_docker: cancerbits/ransmayr2024_ltbr
+# path to the directory that holds this file
+project_root_host: /path/to/project/ransmayr2024_ltbr
+# this dir will be scanned recursively for 10x Cell Ranger output
+data_root_host: /path/to/data/ransmayr2024_ltbr
+# this is where the output files get written to
+out_root_host: /path/to/output/ransmayr2024_ltbr
+# path to directory with azimuth reference Seurat object
+azimuth_ref_human_pbmc_host: /path/to/resources/azimuth/ref_human_pbmc
+# do not change the next line
+project_root: /home/rstudio
+# do not change the next line
+data_root: /home/rstudio/mnt_data
+# do not change the next line
+out_root: /home/rstudio/mnt_out
+# do not change the next line
+azimuth_ref_human_pbmc: /home/rstudio/mnt_azimuth_ref

@@ -1,0 +1,231 @@
+---
+title: 'Load and filter single-cell data from LTBR lymphocytes'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  source(file.path(config$project_root, 'R', 'utils.R'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = FALSE, scrollX = TRUE, scrollY = '350px',
+                          scrollCollapse = TRUE, searching = FALSE, autoWidth = TRUE))
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+
+rds_dir <- file.path(config$out_root, 'Rds')
+dir.create(rds_dir)
+```
+
+Get list of count matrices and do QC filtering, create Seurat objects
+
+```{r, fig.width=8, out.width='80%', fig.height=6}
+counts_list <- get_counts(path = config$data_root)
+
+s_list <- list()
+for (n in names(counts_list)) {
+  sample_id <- gsub(pattern = '_GEX_transcriptome', replacement = '', x = n)
+  #sample_id <- naming_table[sample_id, ]
+  tmp <- filter_count_matrix(
+    counts = counts_list[[n]], 
+    percent.mito.th = 15,
+    z.th.counts = c(-2.5, 2.5),
+    z.th.feature_outlier = c(-4, 4),
+    min.features = 300,
+    mito.pattern = "^MT[^0-9a-zA-Z]+",
+    return.seurat = TRUE,
+    sample_id = sample_id,
+    verbose = TRUE)
+  fig <- patchwork::wrap_plots(tmp$figures) + patchwork::plot_annotation(title = tmp$fig_title)
+  show(fig)
+  s_list[[sample_id]] <- tmp$filtered
+}
+```
+
+Perform a "standard" Seurat analysis per sample
+
+```{r, fig.width=12, fig.height=12, out.width='100%'}
+for (sample_id in names(s_list)) {
+  s <- s_list[[sample_id]]
+  s <- SCTransform(s, verbose = FALSE, method = "qpoisson")
+  # exclude some genes from variable features: TR, MT, RP
+  vf <- VariableFeatures(s)
+  exclude <- grepl('^TR[ABGD][VDJ]', vf) | grepl('^MT-', vf) | grepl('^RP[SL]\\d+', vf)
+  VariableFeatures(s) <- vf[!exclude]
+  s <- RunPCA(s, verbose = FALSE)
+  #ElbowPlot(s, ndims = 50)
+  dims <- 1:15
+  s <- RunUMAP(s, dims = dims, verbose = FALSE)
+  s <- FindNeighbors(s, reduction = "pca", dims = dims, verbose = FALSE)
+  s <- FindClusters(s, verbose = FALSE)
+  
+  s$SCT@misc$de_res <- diff_mean_test(y = GetAssayData(s, assay = "SCT", slot = "counts"), 
+    group_labels = s$seurat_clusters, R = 99, only_pos = TRUE, only_top_n = 333, 
+    verbosity = 0)
+  
+  s$SCT@misc$top_markers <- filter(s$SCT@misc$de_res, mean1 >= 0.2) %>%
+    group_by(group1) %>%
+    arrange(-mean1, .by_group = TRUE) %>%
+    mutate(log2FC = scales::oob_squish_any(x = log2FC, range = c(0, 7)),
+           zscore = scales::oob_squish_any(x = zscore, range = c(0, 200)),
+           marker_rank = rank(-log2FC*log2FC*zscore)) %>%
+    slice_min(order_by = marker_rank, n = 4, with_ties = FALSE) %>% 
+    select(group1, gene, mean1, mean2, log2FC, zscore, emp_pval_adj)
+  
+  s <- GetResidual(s, features = s$SCT@misc$top_markers$gene, verbose = FALSE)
+  s$log10_nCount_RNA <- log10(s$nCount_RNA)
+  s_list[[sample_id]] <- s
+  
+  p1 <- DimPlot(s, label = TRUE, repel = TRUE) 
+  #p2 <- DoHeatmap(s, features = s$SCT@misc$top_markers$gene, slot = "scale.data") + NoLegend()
+  cells <- WhichCells(s, downsample = 100)
+  p2 <- DoHeatmap(s, features = s$SCT@misc$top_markers$gene, slot = "scale.data", cells = cells) + NoLegend()
+  p3 <- ggplot(s@meta.data, aes(seurat_clusters, fill = seurat_clusters)) + geom_bar() + NoLegend()
+  p4 <- VlnPlot(s, features = c('percent.mito', 'log10_nCount_RNA', 'nFeature_RNA'))
+  common_title <- sprintf("Unsupervised clustering %s, %d cells", s@meta.data$orig.ident[1], ncol(s))
+  show((((p1 / p3) + plot_layout(heights = c(3,2)) | p2) / p4) + plot_layout(widths = c(1, 2)) + plot_layout(heights = c(3,1)) + plot_annotation(title = common_title))
+}
+```
+
+
+
+Perform a "standard" Seurat analysis on a merged object
+
+But first show cell metrics per sample
+
+```{r, fig.width=9, fig.height=7, out.width='90%'}
+s <- merge(s_list[[1]], s_list[2:length(s_list)])
+
+p1 <- ggplot(s@meta.data, aes(percent.mito)) + 
+  geom_histogram(aes(y=..density..), binwidth = 0.5) +
+  facet_grid(orig.ident ~ .) + xlab('% mito reads')
+p2 <- ggplot(s@meta.data, aes(nFeature_RNA)) + 
+  geom_histogram(aes(y=..density..), binwidth = 50) +
+  facet_grid(orig.ident ~ .) + xlab('Genes detected')
+p3 <- ggplot(s@meta.data, aes(nCount_RNA)) + 
+  geom_histogram(aes(y=..density..), binwidth = 100) +
+  facet_grid(orig.ident ~ .) + xlab('Transcripts counted')
+p4 <- ggplot(s@meta.data, aes(nCount_RNA, nFeature_RNA)) + 
+  geom_point() + geom_smooth() +
+  coord_trans(x = 'log10', y = 'log10') +
+  facet_grid(orig.ident ~ .) + xlab('Transcripts counted') +
+  ylab('Genes detected')
+
+show(p1 | p2 | p3 | p4)
+```
+
+
+```{r}
+s <- SCTransform(s, verbose = FALSE, method = "qpoisson")
+# exclude some genes from variable features: TR, MT, RP
+vf <- VariableFeatures(s)
+exclude <- grepl('^TR[ABGD][VDJ]', vf) | grepl('^MT-', vf) | grepl('^RP[SL]\\d+', vf)
+VariableFeatures(s) <- vf[!exclude]
+s <- RunPCA(s, verbose = FALSE)
+ElbowPlot(s, ndims = 50)
+dims <- 1:15
+s <- RunUMAP(s, dims = dims, verbose = FALSE)
+s <- FindNeighbors(s, reduction = "pca", dims = dims, verbose = FALSE)
+s <- FindClusters(s, verbose = FALSE)
+  
+s$SCT@misc$de_res <- diff_mean_test(y = GetAssayData(s, assay = "SCT", slot = "counts"), 
+    group_labels = s$seurat_clusters, R = 99, only_pos = TRUE, only_top_n = 333, 
+    verbosity = 0)
+
+s$SCT@misc$top_markers <- filter(s$SCT@misc$de_res, mean1 >= 0.2) %>%
+    group_by(group1) %>%
+    arrange(-mean1, .by_group = TRUE) %>%
+    mutate(log2FC = scales::oob_squish_any(x = log2FC, range = c(0, 7)),
+           zscore = scales::oob_squish_any(x = zscore, range = c(0, 200)),
+           marker_rank = rank(-log2FC*log2FC*zscore)) %>%
+    slice_min(order_by = marker_rank, n = 4, with_ties = FALSE) %>% 
+    select(group1, gene, mean1, mean2, log2FC, zscore, emp_pval_adj)
+
+s <- GetResidual(s, features = s$SCT@misc$top_markers$gene, verbose = FALSE)
+
+p1 <- DimPlot(s, label = TRUE, repel = TRUE) + 
+    ggtitle(sprintf("Unsupervised clustering, %d cells", ncol(s)))
+p2 <- DimPlot(s, group.by = 'orig.ident') + 
+    ggtitle('Colored by sample')
+#p <- ((p1 + p2) / p3) + patchwork::plot_layout(heights = c(1,3))
+#show(p)
+```
+
+```{r, fig.width=10, out.width='100%', fig.height=5}
+show(p1 + p2)
+```
+
+Show how samples contribute to the clusters
+```{r, fig.width=9, out.width='100%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'seurat_clusters', 
+                        comp_var = 'orig.ident', group_name = 'Cluster', 
+                        comp_name = 'Sample')
+show(cp$figure)
+```
+
+Show sample composition
+```{r, fig.width=9, out.width='100%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'orig.ident', 
+                        comp_var = 'seurat_clusters', group_name = 'Sample', 
+                        comp_name = 'Cluster')
+show(cp$figure & guides(fill=guide_legend(ncol=3)))
+```
+
+
+```{r, fig.width=14, out.width='100%', fig.height=4}
+p1 <- VlnPlot(s, features = c('percent.mito', 'log10_nCount_RNA', 'nFeature_RNA'))
+show(p1)
+```
+
+
+```{r, fig.width=10, out.width='100%', fig.height=10}
+show(DoHeatmap(s, features = s$SCT@misc$top_markers$gene, slot = "scale.data") + NoLegend())
+cells <- WhichCells(s, downsample = 100)
+show(DoHeatmap(s, features = s$SCT@misc$top_markers$gene, slot = "scale.data", cells = cells) + NoLegend())
+```
+
+```{r, out.width='100%', fig.width=14, fig.height=3.5}
+p1 <- DimPlot(s, label = TRUE, repel = TRUE, split.by = 'orig.ident') + NoLegend()
+show(p1)
+```
+
+Save merged object
+
+```{r}
+saveRDS(object = s, file = file.path(rds_dir, '01_s_merged.Rds'))
+```
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

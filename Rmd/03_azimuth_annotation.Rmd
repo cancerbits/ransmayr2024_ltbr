@@ -1,0 +1,187 @@
+---
+title: 'Azimuth Cell Type Annotation'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('Azimuth')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  source(file.path(config$project_root, 'R', 'utils.R'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = FALSE, scrollX = TRUE, scrollY = '350px',
+                          scrollCollapse = TRUE, searching = FALSE, autoWidth = TRUE))
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+
+rds_dir <- file.path(config$out_root, 'Rds')
+```
+
+## Load data and predict cell types
+```{r}
+s <- readRDS(file = file.path(rds_dir, '02_integrated_seurat_object.Rds'))
+pred <- azimuth_annotation(query = s, 
+                           reference_path = config$azimuth_ref_human_pbmc, 
+                           reference_column = 'celltype.l2')
+s[['az_umap']] <- pred$umap
+s <- AddMetaData(s, pred$prediction)
+```
+
+## Visualize the results
+```{r, out.width='100%', fig.width=12, fig.height=7}
+az_plots <- azimuth_plots(s, reduction = 'az_umap', 
+                          annotation = 'az.annotation', 
+                          annotation_score = 'az.annotation.score', 
+                          mapping_score = 'az.mapping.score')
+lapply(az_plots, show)
+```
+
+```{r, fig.width=10, fig.height=5, out.width='100%'}
+show(DimPlot(s, reduction = "int_umap", group.by = "az.annotation", label = TRUE, repel = TRUE))
+#show(DimPlot(s, reduction = "az_umap", group.by = "az.annotation", label = TRUE, repel = TRUE))
+```
+
+```{r, fig.width=10, fig.height=10, out.width='100%'}
+p1 <- DimPlot(object = s, reduction = "int_umap", split.by = 'az.annotation', ncol = 5) + NoLegend()
+show(p1)
+```
+
+
+Show integration-cluster composition based on predictions
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'integration_cluster', 
+                        comp_var = 'az.annotation', group_name = 'Integration cluster', 
+                        comp_name = 'Cell type', freq_limit = 0.05)
+show(cp$figure)
+```
+
+Show per-sample composition based on predictions
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'orig.ident', 
+                        comp_var = 'az.annotation', group_name = 'Sample', 
+                        comp_name = 'Cell type', freq_limit = 0.05)
+show(cp$figure)
+```
+
+
+Show fraction details
+```{r, out.width='100%', fig.width=10, fig.height=7}
+cp <- composition_plots(df = s@meta.data, group_var = 'orig.ident', 
+                        comp_var = 'az.annotation', group_name = 'Sample', 
+                        comp_name = 'Cell type')
+p1 <- ggplot(cp$data, aes(Sample, freq)) + geom_point() +
+  ylab('Fraction') + xlab('Sample') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~ label_filtered, scales = 'free_y', ncol = 5) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+B cell composition
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- filter(s@meta.data, grepl('^B ', az.annotation)) %>%
+  composition_plots(group_var = 'orig.ident', comp_var = 'az.annotation', 
+                    group_name = 'Sample', comp_name = 'Cell type')
+show(cp$figure)
+```
+
+
+Number of cells
+```{r}
+tab <- table(s@meta.data$az.annotation, s@meta.data$orig.ident)
+print(tab)
+```
+
+
+## Discard low-confidence predictions
+
+Look at composition per sample again,but set predictions where at least one score is lower than 0.5 to NA
+```{r}
+s$az.annot.filtered <- s$az.annotation
+sel <- s$az.annotation.score >= 0.5 & s$az.mapping.score >= 0.5
+s$az.annot.filtered[!sel] <- NA
+
+```
+
+Show integration-cluster composition based on predictions
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'integration_cluster', 
+                        comp_var = 'az.annot.filtered', group_name = 'Integration cluster', 
+                        comp_name = 'Cell type', freq_limit = 0.05)
+show(cp$figure)
+```
+
+Show per-sample composition based on predictions
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- composition_plots(df = s@meta.data, group_var = 'orig.ident', 
+                        comp_var = 'az.annot.filtered', group_name = 'Sample', 
+                        comp_name = 'Cell type', freq_limit = 0.05)
+show(cp$figure)
+```
+
+Remove NA-predicted cells
+```{r, fig.width=9, out.width='90%', fig.height=3.5}
+cp <- filter(s@meta.data, !is.na(az.annot.filtered)) %>% 
+  composition_plots(group_var = 'orig.ident', comp_var = 'az.annot.filtered', 
+                    group_name = 'Sample', comp_name = 'Cell type', 
+                    freq_limit = 0.05)
+show(cp$figure)
+```
+
+
+Show fraction details
+```{r, out.width='100%', fig.width=10, fig.height=7}
+cp <- filter(s@meta.data, !is.na(az.annot.filtered)) %>% 
+  composition_plots(group_var = 'orig.ident', comp_var = 'az.annot.filtered', 
+                    group_name = 'Sample', comp_name = 'Cell type')
+p1 <- ggplot(cp$data, aes(Sample, freq)) + geom_point() +
+  ylab('Fraction') + xlab('Sample') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~ label_filtered, scales = 'free_y', ncol = 5) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+
+## Save, Runtime, Session info
+
+```{r}
+saveRDS(object = s@meta.data, file = file.path(rds_dir, '03_integrated_annotated_meta_data.Rds'))
+saveRDS(object = s$az_umap, file = file.path(rds_dir, '03_integrated_annotated_az_umap.Rds'))
+```
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```
