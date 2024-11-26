@@ -37,4 +37,4 @@ Paths in the `config.yaml` file starting with "/path/to/" will have to be set.
 
 **Paper:** Science Immunology, 22 Nov 2024, Vol 9, Issue 101, DOI: [10.1126/sciimmunol.adq8796](https://doi.org/10.1126/sciimmunol.adq8796)
 
-**Data files:** Raw data files are available at [The European Genome-phenome Archive (EGA)]([https://ega-archive.org](https://ega-archive.org/studies/EGAS00001007271)).
+**Data files:** Raw data files are available at [The European Genome-phenome Archive (EGA)](https://ega-archive.org/studies/EGAS00001007271).
